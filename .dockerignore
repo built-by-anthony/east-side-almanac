@@ -1,0 +1,6 @@
+.venv
+.git
+data
+scratch*
+**/__pycache__
+infra
