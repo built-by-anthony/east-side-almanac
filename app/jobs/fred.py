@@ -1,21 +1,112 @@
+"""FRED job: seven national macro series -> long fact table -> one parquet file per pull date."""
 import logging
+from datetime import date, datetime, timezone 
+
+import polars as pl 
+import requests 
 
 from app import config
 
 log = logging.getLogger(__name__)
 
 FRED_KEY_VAR = "FRED_API_KEY"
+API_URL = "https://api.stlouisfed.org/fred/series/observations"
+
+# FRED series id -> (our metric name, period_type)
+# The metric names are the start of the shared vocabulary that Phase 2 moves into its own module
+SERIES = {
+    "DGS10"        : ("treasury_10y_yield", "day"),
+    "DGS2"         : ("treasury_2y_yield", "day"),
+    "MORTGAGE30US" : ("mortgage_30y_fixed_rate", "week"),
+    "MORTGAGE15US" : ("mortgage_15y_fixed_rate", "week"),
+    "DFF"          : ("fed_funds_effective_rate", "day"),
+    "CPIAUCSL"     : ("cpi_all_items_sa", "month"),
+    "UNRATE"       : ("unemployment_rate", "month"),
+}
+
+# Each pull re-reads this many years of that FRED's revisions (CPI seasonal factors
+# reach back ~5 years) appear as new vintages. Full history comes from a Phase 7 backfill
+LOOKBACK_YEARS = 5
+
+# The fact table's column order, the same for every source
+COLUMNS = ["geo", "geo_level", "metric", "period_start", "period_type", "value", "source", "pulled_at"]
+
+def fetch(session: requests.Session, series_id: str, api_key: str, start: date) -> list[dict]:
+    params = {
+        "series_id" : series_id, 
+        "api_key"  : api_key, 
+        "file_type" : "json", 
+        "observation_start" : start.isoformat(), 
+    }
+
+    try: 
+        resp = session.get(API_URL, params=params, timeout=30)
+    except requests.RequestException as e:
+        # requests puts the full URL, including ?api_key=..., in its exception messages.
+        # Re-raise with only the series and error type `from None` drops the original 
+        # exception from the traceback so they key never reaches CloudWatch.
+        raise RuntimeError(f"FRED {series_id}: request failed ({type(e).__name__})") from None
+    if resp.status_code != 200:
+        # Not raise_for_status() for the same teason: its message includes the URL. 
+        raise RuntimeError(f"FRED {series_id}: HTTP {resp.status_code}")
+    payload = resp.json()
+    if "observations" not in payload: 
+        raise RuntimeError(f"FRED {series_id}: unexpected response: {payload.get('error_message', 'no observations')}")
+    return payload["observations"]      
 
 def run() -> None: 
-    # Read config when the job runs, not at import time, so tests can set env per test.
     curated = config.curated_root()
-
-    # Injected by the ECS task definition's `secrets` block in AWS (so the task role
-    # needs no SSM permission). Locally, your shell fetches it from SSM and psses -e FRED_KEY_API.
     api_key = config.require(
-        FRED_KEY_VAR,
-        "Locally: export it from SSM and pass -e FRED_API_KEY. In AWS: task definition `secrets`." 
+        FRED_KEY_VAR, 
+        "Locally: export it from SSM and pass -e FRED_API_KEY. In AWS: task definition `secrets`.",
     )
 
-    # Never log api_key, not even a prefix. 
-    log.info("fred: would write to %s (not implemented yet)", curated)
+    # One timestampe for the whole run, never per row: it identifies this vintage
+    pulled_at = datetime.now(timezone.utc)
+    start = date(pulled_at.year - LOOKBACK_YEARS, 1, 1)
+
+    rows = []
+    with requests.Session() as session: # reuses one TLS connection for all seven calls 
+        for series_id, (metric, period_type) in SERIES.items():
+            observations = fetch(session, series_id, api_key, start)
+
+
+            values = []
+            for obs in observations: 
+                # FRED marks a missing observation (e.g. a bond-market holiday) with a ".".
+                if obs["value"] == ".":
+                    continue
+                # Anything else non-numeric makes float() raise and fail the job loudly. 
+                values.append((obs["date"], float(obs["value"])))
+
+            # A series that returns nothing is a failure, not a quiet success 
+            if not values: 
+                raise RuntimeError(f"FRED {series_id}: no observations since {start}")
+
+            log.info("fred: %s -> %s, %d rows", series_id, metric, len(values))
+
+            # One fact-table row per (date, value) pari. 
+            for obs_date, value in values: 
+                rows.append({
+                    "metric"      : metric, 
+                    "period_start": obs_date, 
+                    "period_type" : period_type, 
+                    "value"       : value, 
+                })
+
+    df = (
+        pl.DataFrame(rows)
+        .with_columns(
+            pl.col("period_start").str.to_date(), # "2026-10-06" -> Date
+            pl.lit("US").alias("geo"), 
+            pl.lit("national").alias("geo_level"),
+            pl.lit("fred").alias("source"),
+            pl.lit(pulled_at).alias("pulled_at") # timezone aware datetime -> Datetime(UTC)
+        )
+        .select(COLUMNS)
+    )
+
+    # One file per pull date: a same-day rerun overwrites it, so a day never gets two vintages. 
+    path = f"{curated}/fred/{pulled_at:%Y-%m-%d}.parquet"
+    df.write_parquet(path, mkdir=True)
+    log.info("fred: wrote %d rows to %s", df.height, path)
