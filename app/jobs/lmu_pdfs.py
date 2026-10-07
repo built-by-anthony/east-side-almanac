@@ -132,7 +132,7 @@ def run() -> None:
     pulled_at = datetime.now(timezone.utc)
     day = f"{pulled_at:%Y-%m-%d}"
     # Reports publish around the 8th of the following month, so ask for last month.
-    month = add_months(date(pulled_at.year, pulled_at.month, 1), -1)
+    month = config.lmu_report_month() or add_months(date(pulled_at.year, pulled_at.month, 1), -1)
     log.info("lmu: requesting report month %s", f"{month:%Y-%m}")
 
     rows = []

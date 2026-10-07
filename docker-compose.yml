@@ -11,7 +11,8 @@ services:
       # No value: Compose copies FRED_API_KEY from your shell if it's set and leaves it
       # unset otherwise, in which case the fred job fails with its clear error. No .env file to leak.
       FRED_API_KEY:
-
+      # Optional: a specific LMU report month (YYYY-MM). Unset means last month.
+      LMU_REPORT_MONTH:
     volumes:
       # Bind mount: the container's /data is your repo's ./data (already in .gitignore).
       - ./data:/data

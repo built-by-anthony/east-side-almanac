@@ -5,6 +5,7 @@ The same image runs locally and on Fargate, and ECS can only configure a
 container through environment variables, secrets, and the command.
 """
 import os
+from datetime import date, datetime
 
 OUTPUT_ROOT_VAR = "ALMANAC_OUTPUT_ROOT"
 
@@ -25,6 +26,17 @@ def output_root() -> str:
     root = require(OUTPUT_ROOT_VAR, "Use /data locally or s3://<bucket> in AWS.")
     # Strip a trailing slash to "s3://bucket/ doesn't produce "s3://bucket//raw".
     return root.rstrip("/")
+
+def lmu_report_month() -> date | None:
+    # Unset: the job asks for last month (the scheduled case). Set: a specific
+    # report month, for reruns and backfill. Bad input fails fast, never guesses.
+    value = os.environ.get("LMU_REPORT_MONTH", "").strip()
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m").date()
+    except ValueError:
+        raise ConfigError(f"LMU_REPORT_MONTH={value!r} is not YYYY-MM.") from None
 
 # raw/ and curated/ are fixed parts of the asset's layout, not configuration.
 # f-strings, not os.path.join: these must work for both /data and s3:// roots.
