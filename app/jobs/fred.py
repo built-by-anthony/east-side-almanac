@@ -1,11 +1,12 @@
 """FRED job: seven national macro series -> long fact table -> one parquet file per pull date."""
 import logging
+import json
 from datetime import date, datetime, timezone 
 
 import polars as pl 
 import requests 
 
-from app import config
+from app import config, storage
 
 log = logging.getLogger(__name__)
 
@@ -31,7 +32,7 @@ LOOKBACK_YEARS = 5
 # The fact table's column order, the same for every source
 COLUMNS = ["geo", "geo_level", "metric", "period_start", "period_type", "value", "source", "pulled_at"]
 
-def fetch(session: requests.Session, series_id: str, api_key: str, start: date) -> list[dict]:
+def fetch(session: requests.Session, series_id: str, api_key: str, start: date) -> bytes:
     params = {
         "series_id" : series_id, 
         "api_key"  : api_key, 
@@ -49,10 +50,14 @@ def fetch(session: requests.Session, series_id: str, api_key: str, start: date) 
     if resp.status_code != 200:
         # Not raise_for_status() for the same teason: its message includes the URL. 
         raise RuntimeError(f"FRED {series_id}: HTTP {resp.status_code}")
-    payload = resp.json()
+    return resp.content
+
+def parse(series_id: str, body: bytes) -> list[dict]:
+    """Bytes -> FRED's list of {date, value} observations. Fails loudly on anything unexpected."""
+    payload = json.loads(body)
     if "observations" not in payload: 
-        raise RuntimeError(f"FRED {series_id}: unexpected response: {payload.get('error_message', 'no observations')}")
-    return payload["observations"]      
+        raise RuntimeError(f"FRED {series_id}: unexpected resposne: {payload.get('error_message', 'no observations')}")
+    return payload["observations"]
 
 def run() -> None: 
     curated = config.curated_root()
@@ -64,12 +69,18 @@ def run() -> None:
     # One timestampe for the whole run, never per row: it identifies this vintage
     pulled_at = datetime.now(timezone.utc)
     start = date(pulled_at.year - LOOKBACK_YEARS, 1, 1)
+    raw_dir = f"{config.raw_root()}/fred/{pulled_at:%Y-%m-%d}"
 
     rows = []
     with requests.Session() as session: # reuses one TLS connection for all seven calls 
         for series_id, (metric, period_type) in SERIES.items():
-            observations = fetch(session, series_id, api_key, start)
+            body = fetch(session, series_id, api_key, start)
 
+            # Save the source bytes BEFORE parsing: if parse() fails, teh exact
+            # response that broke it is already on disk to debug from
+            storage.write_bytes(f"{raw_dir}/{series_id}.json", body)
+
+            observations = parse(series_id, body)
 
             values = []
             for obs in observations: 
@@ -109,4 +120,4 @@ def run() -> None:
     # One file per pull date: a same-day rerun overwrites it, so a day never gets two vintages. 
     path = f"{curated}/fred/{pulled_at:%Y-%m-%d}.parquet"
     df.write_parquet(path, mkdir=True)
-    log.info("fred: wrote %d rows to %s", df.height, path)
+    log.info("fred: wrote %d rows to %s (raw in %s)", df.height, path, raw_dir)
