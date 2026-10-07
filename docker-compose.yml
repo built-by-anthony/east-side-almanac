@@ -1,0 +1,17 @@
+services:
+  app:
+    # Build from the Dockerfile in this directory and tag the result almanac:dev,
+    # the same tag you've been using by hand.
+    build: .
+    image: almanac:dev
+
+    environment:
+      # Local output goes to /data inside the container, which is mounted from ./data below.
+      ALMANAC_OUTPUT_ROOT: /data
+      # No value: Compose copies FRED_API_KEY from your shell if it's set and leaves it
+      # unset otherwise, in which case the fred job fails with its clear error. No .env file to leak.
+      FRED_API_KEY:
+
+    volumes:
+      # Bind mount: the container's /data is your repo's ./data (already in .gitignore).
+      - ./data:/data
