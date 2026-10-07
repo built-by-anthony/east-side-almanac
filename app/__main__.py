@@ -1,3 +1,3 @@
-import polars as pl
+from app.cli import main 
 
-print("Hello from the docker cotnainer we are runnnig polars version: ", pl.__version__)
+raise SystemExit(main())

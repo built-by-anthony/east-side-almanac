@@ -1,4 +1,4 @@
-ARG BASE=python:3.12-slim
+ARG BASE=python:3.12-slim@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f
 FROM ${BASE} AS builder
 COPY --from=ghcr.io/astral-sh/uv:0.12.23 /uv /uvx /bin/
 ENV  UV_COMPILE_BYTECODE=1  UV_LINK_MODE=copy  UV_PYTHON_DOWNLOADS=0  UV_NO_DEV=1
@@ -10,13 +10,14 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-install-project
 
 FROM ${BASE}
-WORKDIR /app 
+WORKDIR /app
 COPY --from=builder /app/.venv /app/.venv
 COPY app/ ./app/
 ENV PATH="/app/.venv/bin:$PATH"
 
-RUN useradd --system --uid 10001 --no-create-home --shell /urs/sbin/nologin almanac \ 
-    && mkdir /data \ 
-    && chown almanac.almanac /data
+RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin almanac \
+    && mkdir /data \
+    && chown almanac:almanac /data
 USER 10001
-CMD ["python", "-m", "app"]
+ENTRYPOINT ["python", "-m", "app"]
+CMD ["--help"]
