@@ -1,0 +1,11 @@
+data/ 
+.env
+*.env
+.terraform/ 
+*.tfstate
+*.tfstate.*
+*.tfvars
+__pycache__/
+.venv/
+.pytest_cache/
+scratch*
