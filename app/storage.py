@@ -1,5 +1,6 @@
 """Write bytes to a local path or an s3:// URI. The only module that knows the difference"""
 from pathlib import Path 
+import shutil
 
 def write_bytes(uri: str, data: bytes) -> None: 
     if uri.startswith("s3://"):
@@ -15,4 +16,17 @@ def write_bytes(uri: str, data: bytes) -> None:
         path = Path(uri)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
-    
+
+def copy_file(local_path: Path, uri: str) -> None: 
+    """Copy a local file to a local path or s3:// URI without loading it into memory."""
+    if uri.startswith("s3://"): 
+        import boto3 
+
+        bucket, _, key = uri.removeprefix("s3://").partition("/")
+
+        # upload_file witches to a multipart upload for large files automatically 
+        boto3.client("s3").upload_file(str(local_path), bucket, key)
+    else:
+        dest = Path(uri)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(local_path, dest)
