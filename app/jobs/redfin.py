@@ -1,13 +1,14 @@
 """Redfin job: Housing Market Tracker (all cities, monthly file) -> raw CSV + long fact table."""
 import logging
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import polars as pl 
 import requests 
 
-from app import config, storage
+from app import config, storage, schema
 
 log = logging.getLogger(__name__)
 
@@ -27,6 +28,10 @@ CITIES = {
     12062: "North St. Paul",
 }
 
+# The ID map is Redfin-specific; the names must match the asset's city list exactly.
+if set(CITIES.values()) != set(schema.CITIES):
+    raise RuntimeError(f"redfin: CITIES out of sync with schema.CITIES: {set(CITIES.values()) ^ set(schema.CITIES)}")
+
 # Every row in the current file is a rolling 3-month window. If Redfin changes this, 
 # period_type would silently be wrong, so the job checks it and fails instead. 
 EXPECTED_FREQUENCY = "Rolling 3 Months"
@@ -44,22 +49,24 @@ METRICS = {
     "INVENTORY": "inventory",
     "PENDING SALES": "pending_sales",
     "MEDIAN NEW LISTING PRICE ($)": "median_new_listing_price",
-    "MEDIAN NEW LISTING PRICE PER SQ.FT. ($)": "median_new_listing_ppsf",
-    "MEDIAN SALE PRICE PER SQ.FT. ($)": "median_sale_ppsf",
-    "MONTHS OF SUPPLY": "months_of_supply",
-    "PERCENT OFF MARKET IN TWO WEEKS (%)": "pct_off_market_in_two_weeks",
+    "MEDIAN NEW LISTING PRICE PER SQ.FT. ($)": "median_new_listing_price_per_sqft",
+     "MEDIAN SALE PRICE PER SQ.FT. ($)": "median_sale_price_per_sqft",
+      "MONTHS OF SUPPLY": "months_of_supply_closed_pace",
+     "PERCENT OFF MARKET IN TWO WEEKS (%)": "off_market_in_two_weeks_pct",
 }
 
-# Same fact-table column order as fred, Phase 2 moves this into a shared module. 
-COLUMNS = ["geo", "geo_level", "metric", "period_start", "period_type", "value", "source", "pulled_at"]
+schema.require_known(METRICS.values(), "redfin")
 
-def download(dest: Path) -> None: 
-    """Stream the file to disk in 8 MB chunks; never hold in memory."""
+def download(dest: Path) -> date:
+    """Stream the file to disk in 8 MB chunks; never hold in memory. Returns the file's Last-Modified date."""
     # timeout=(connect, read): 10s to connect, then up to 300s of silence between chunks. 
     with requests.get(URL, stream=True, timeout=(10, 300)) as resp: 
         # No secret in this URL, so reaise_for_status() is safe here (unlike Fred).
         resp.raise_for_status() 
         expected = int(resp.headers["Content-Length"])
+
+        # The only publication marker Redfin gives. Weak: re-uploads change it without changing data.
+        as_of = parsedate_to_datetime(resp.headers["Last-Modified"]).date()
         log.info(
             "redfin: downloading %.0f MB, Last-Modified %s",
             expected / 1e6, resp.headers.get("Last-Modified")
@@ -73,6 +80,8 @@ def download(dest: Path) -> None:
     # so a truncated file fails here instead of quietly losing cities later.
     if written != expected:
         raise RuntimeError(f"redfin: truncated download, got {written} of {expected} bytes")
+
+    return as_of
 
 def read_cities(path: Path) -> pl.DataFrame: 
     """Lazily scan the 1.1 GB CSV and keep only our seven cities' rows."""
@@ -107,7 +116,7 @@ def validate(wide: pl.DataFrame) -> None:
     if other:
         raise RuntimeError(f"redfin: undexpected FREQUENCY values {other}; period_type would be wrong")
 
-def to_facts(wide: pl.DataFrame, pulled_at: datetime) -> pl.DataFrame:
+def to_facts(wide: pl.DataFrame, pulled_at: datetime, as_of: date) -> pl.DataFrame:
     """One wide row per city-window -> one long row per city-window-metric"""
     return (
         wide.select(
@@ -125,9 +134,10 @@ def to_facts(wide: pl.DataFrame, pulled_at: datetime) -> pl.DataFrame:
             # Overlapping windows: Jun-Aug, then Jul-Sep. Never sum across consecutive rows.
             pl.lit("rolling_3_month").alias("period_type"),
             pl.lit("redfin").alias("source"), 
-            pl.lit(pulled_at).alias("pulled_at")
+            pl.lit(pulled_at).alias("pulled_at"),
+            pl.lit(as_of).alias("source_as_of")
         )
-        .select(COLUMNS)
+        .select(schema.COLUMNS)
     )
 
 def run() -> None: 
@@ -142,13 +152,13 @@ def run() -> None:
     # even if something fails. 
     with tempfile.TemporaryDirectory() as tmp: 
         local = Path(tmp) / "all_cities.csv"
-        download(local)
+        as_of = download(local)
         # Raw frist, before parsing: the whole file as received, so a parser bug can be replayed. 
         storage.copy_file(local, f"{raw_root}/redfin/{day}/all_cities.csv")
         wide = read_cities(local)
 
     validate(wide)
-    df = to_facts(wide, pulled_at)
+    df = to_facts(wide, pulled_at, as_of)
 
     for name, count in df.group_by("geo").len().sort("geo").iter_rows():
         log.info("redfin: %s, %d rows", name, count)

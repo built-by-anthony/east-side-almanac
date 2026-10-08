@@ -9,28 +9,28 @@ import pdfplumber
 import polars as pl 
 import requests
 
-from app import config, storage
+from app import config, storage, schema
 
 log = logging.getLogger(__name__)
 
 # {YYYY-MM} selects a specific report month; the city name is URL-encoded ("North%20St.%20Paul").
 URL_TEMPLATE = "https://maar.stats.10kresearch.com/docs/lmu/{month}/x/{city}"
 
-CITIES = ["Woodbury", "Lake Elmo", "Oakdale", "Maplewood", "Stillwater", "Cottage Grove", "North St. Paul"]
-
-# PDF row label -> our metric name. Names match REdfin's where the concept is the same; 
-# kept distinct where the definition may differ 
+# PDF row label -> our metric name (must exist in app.schema.METRICS). Shared with Redfin
+# where the concept is the same; kept distinct where the definition may differ.
 LABELS = {
     "New Listings": "new_listings",
     "Closed Sales": "homes_sold",
     "Median Sales Price": "median_sale_price",
-    "Average Sales Price": "average_sale_price",
-    "Price Per Square Foot": "price_per_sqft",
-    "Percent of Original List Price Received": "pct_of_original_list_received",
-    "Days on Market Until Sale": "days_on_market",
+    "Average Sales Price": "avg_sale_price",
+    "Price Per Square Foot": "sale_price_per_sqft",
+    "Percent of Original List Price Received": "avg_sale_to_original_list_pct",
+    "Days on Market Until Sale": "avg_cumulative_days_on_market",
     "Inventory of Homes for Sale": "inventory",
-    "Months Supply of Inventory": "months_of_supply",
+    "Months Supply of Inventory": "months_of_supply_pending_12m",
 }
+
+schema.require_known(LABELS.values(), "lmu")
 
 MONTHS = {name: i for i, name in enumerate(
     ["January", "February", "March", "April", "May", "June",
@@ -39,12 +39,13 @@ MONTHS = {name: i for i, name in enumerate(
 # "Local Market Update – August 2026". The dash is an en dash in the PDF; accept a hyphen too.
 REPORT_RE = re.compile(r"Local Market Update\s+[–-]\s+([A-Z][a-z]+)\s+(\d{4})")
 
+# Footer: "Current as of September 8, 2026." The source's own publication date for this report.
+AS_OF_RE = re.compile(r"Current as of ([A-Z][a-z]+) (\d{1,2}), (\d{4})")
+
 # One value cell: "--", "$499,500", "1,786", "98.1%", "2.8".
 VALUE = r"(--|\$?[\d,]+(?:\.\d+)?%?)"
 # One change cell: "--", "+ 9.4%", "-16.1%", "0.0%" (the sign is optional and may be followed by a space).
 CHANGE = r"(--|[+-]?\s?[\d.]+%)"
-
-COLUMNS = ["geo", "geo_level", "metric", "period_start", "period_type", "value", "source", "pulled_at"]
 
 def add_months(d: date, n: int) -> date:
     """First of the month n months from d (n may be negative)."""
@@ -67,8 +68,8 @@ def to_number(cell: str) -> float | None:
         return None
     return float(cell.replace("$", "").replace(",", "").replace("%", ""))
 
-def parse(pdf: bytes, city: str) -> tuple[date, list[dict]]:
-    """PDF bytes -> (report month, fact rows without geo/source/pulled_at). Pure: no I/O, easy to test."""
+def parse(pdf: bytes, city: str) -> tuple[date, date, list[dict]]:
+    """PDF bytes -> (report month, as-of date, fact rows without geo/source/pulled_at). Pure: no I/O."""
     with pdfplumber.open(io.BytesIO(pdf)) as doc:
         if len(doc.pages) != 1:
             raise RuntimeError(f"lmu {city}: expected 1 page, got {len(doc.pages)}")
@@ -89,6 +90,12 @@ def parse(pdf: bytes, city: str) -> tuple[date, list[dict]]:
     if not m or m[1] not in MONTHS:
         raise RuntimeError(f"lmu {city}: report month header not found")
     month = date(int(m[2]), MONTHS[m[1]], 1)
+    
+    # Missing footer = layout change. Fail rather than store a null as_of for one city.
+    a = AS_OF_RE.search(text)
+    if not a or a[1] not in MONTHS:
+        raise RuntimeError(f"lmu {city}: 'Current as of' footer not found")
+    as_of = date(int(a[3]), MONTHS[a[1]], int(a[2]))
 
     # The four periods each row describes. 
     periods = [
@@ -115,7 +122,7 @@ def parse(pdf: bytes, city: str) -> tuple[date, list[dict]]:
                     "period_type": period_type,
                     "value": value,
                 })
-    return month, rows
+    return month, as_of, rows 
 
 def fetch(session: requests.Session, month: date, city: str) -> bytes:
     url = URL_TEMPLATE.format(month=f"{month:%Y-%m}", city=quote(city))
@@ -125,11 +132,12 @@ def fetch(session: requests.Session, month: date, city: str) -> bytes:
         raise RuntimeError(f"lmu {city}: expected a PDF, got {resp.headers.get('Content-Type')}")
     return resp.content
 
-def run() -> None: 
+def run(now: datetime | None = None) -> None: 
     curated = config.curated_root()
     raw_root = config.raw_root()
 
-    pulled_at = datetime.now(timezone.utc)
+    # Injectable for tests; the CLI passes nothing, so production behavor is unchanged. 
+    pulled_at = now or datetime.now(timezone.utc)
     day = f"{pulled_at:%Y-%m-%d}"
     # Reports publish around the 8th of the following month, so ask for last month.
     month = config.lmu_report_month() or add_months(date(pulled_at.year, pulled_at.month, 1), -1)
@@ -137,17 +145,18 @@ def run() -> None:
 
     rows = []
     with requests.Session() as session: 
-        for city in CITIES: 
+        for city in schema.CITIES: 
             pdf = fetch(session, month, city)
             # Raw first: the PDF as received, so a parse failure can be debugged and replayed.
             storage.write_bytes(f"{raw_root}/lmu/{day}/{month:%Y-%m}/{city}.pdf", pdf)
 
-            report_month, city_rows = parse(pdf, city)
+            report_month, as_of, city_rows = parse(pdf, city)
             # The server might return a different month (e.g. not yet published). Fail, don't mislabel.
             if report_month != month:
                 raise RuntimeError(f"lmu {city}: asked for {month:%Y-%m}, PDF is {report_month:%Y-%m}")
-            log.info("lmu: %s, %d rows", city, len(city_rows))
-            rows.extend({**r, "geo": city} for r in city_rows)
+            log.info("lmu: %s, %d rows, as of %s", city, len(city_rows), as_of)
+            # Per city, not per run: each PDF carries its own footer.
+            rows.extend({**r, "geo": city, "source_as_of": as_of} for r in city_rows)
 
     df = (
             pl.DataFrame(rows)
@@ -156,7 +165,7 @@ def run() -> None:
                 pl.lit("northstar_lmu").alias("source"),
                 pl.lit(pulled_at).alias("pulled_at"),
         )
-        .select(COLUMNS)
+        .select(schema.COLUMNS)
     )
 
     # One file per pull date, same as the other jobs.

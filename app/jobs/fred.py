@@ -6,7 +6,7 @@ from datetime import date, datetime, timezone
 import polars as pl 
 import requests 
 
-from app import config, storage
+from app import config, storage, schema
 
 log = logging.getLogger(__name__)
 
@@ -14,7 +14,7 @@ FRED_KEY_VAR = "FRED_API_KEY"
 API_URL = "https://api.stlouisfed.org/fred/series/observations"
 
 # FRED series id -> (our metric name, period_type)
-# The metric names are the start of the shared vocabulary that Phase 2 moves into its own module
+# Target names must exist in app.schema.METRICS
 SERIES = {
     "DGS10"        : ("treasury_10y_yield", "day"),
     "DGS2"         : ("treasury_2y_yield", "day"),
@@ -25,12 +25,11 @@ SERIES = {
     "UNRATE"       : ("unemployment_rate", "month"),
 }
 
+schema.require_known((m for m, _ in SERIES.values()), "fred")
+
 # Each pull re-reads this many years of that FRED's revisions (CPI seasonal factors
 # reach back ~5 years) appear as new vintages. Full history comes from a Phase 7 backfill
 LOOKBACK_YEARS = 5
-
-# The fact table's column order, the same for every source
-COLUMNS = ["geo", "geo_level", "metric", "period_start", "period_type", "value", "source", "pulled_at"]
 
 def fetch(session: requests.Session, series_id: str, api_key: str, start: date) -> bytes:
     params = {
@@ -112,9 +111,12 @@ def run() -> None:
             pl.lit("US").alias("geo"), 
             pl.lit("national").alias("geo_level"),
             pl.lit("fred").alias("source"),
-            pl.lit(pulled_at).alias("pulled_at") # timezone aware datetime -> Datetime(UTC)
+            pl.lit(pulled_at).alias("pulled_at"), # timezone aware datetime -> Datetime(UTC)
+            # No per-pull publication date: the response's realtime_start is the query's
+            # real-time period, not when each value was published. True vintages need ALFRED.
+            pl.lit(None, dtype=pl.Date).alias("source_as_of"),
         )
-        .select(COLUMNS)
+        .select(schema.COLUMNS)
     )
 
     # One file per pull date: a same-day rerun overwrites it, so a day never gets two vintages. 
