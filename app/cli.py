@@ -5,9 +5,10 @@ import logging
 from app.config import ConfigError
 
 JOBS = {
-    "fred"    : "app.jobs.fred", 
-    "redfin"  : "app.jobs.redfin", 
-    "lmu-pdfs": "app.jobs.lmu_pdfs",
+    "fred"      : "app.jobs.fred", 
+    "redfin"    : "app.jobs.redfin", 
+    "lmu-pdfs"  : "app.jobs.lmu_pdfs",
+    "reconcile" : "app.jobs.reconcile"
 }
 
 log = logging.getLogger(__name__)

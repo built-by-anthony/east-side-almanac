@@ -9,12 +9,15 @@ import pdfplumber
 import polars as pl 
 import requests
 
-from app import config, storage, schema
+from app import config, storage, schema, quality
 
 log = logging.getLogger(__name__)
 
 # {YYYY-MM} selects a specific report month; the city name is URL-encoded ("North%20St.%20Paul").
 URL_TEMPLATE = "https://maar.stats.10kresearch.com/docs/lmu/{month}/x/{city}"
+
+# The source name, used for the column value AND both storage prefixes, so they can't drift. 
+SOURCE = "northstar_lmu"
 
 # PDF row label -> our metric name (must exist in app.schema.METRICS). Shared with Redfin
 # where the concept is the same; kept distinct where the definition may differ.
@@ -148,7 +151,7 @@ def run(now: datetime | None = None) -> None:
         for city in schema.CITIES: 
             pdf = fetch(session, month, city)
             # Raw first: the PDF as received, so a parse failure can be debugged and replayed.
-            storage.write_bytes(f"{raw_root}/lmu/{day}/{month:%Y-%m}/{city}.pdf", pdf)
+            storage.write_bytes(f"{raw_root}/{SOURCE}/{day}/{month:%Y-%m}/{city}.pdf", pdf)
 
             report_month, as_of, city_rows = parse(pdf, city)
             # The server might return a different month (e.g. not yet published). Fail, don't mislabel.
@@ -162,13 +165,16 @@ def run(now: datetime | None = None) -> None:
             pl.DataFrame(rows)
             .with_columns(
                 pl.lit("city").alias("geo_level"),
-                pl.lit("northstar_lmu").alias("source"),
+                pl.lit(SOURCE).alias("source"),
                 pl.lit(pulled_at).alias("pulled_at"),
         )
         .select(schema.COLUMNS)
     )
 
-    # One file per pull date, same as the other jobs.
-    path = f"{curated}/lmu/{day}.parquet"
+    quality.validate(df, SOURCE, expected_geos=set(schema.CITIES), expected_metrics=set(LABELS.values()))
+
+    # Logical run = pull date + report month: backfilling several months in one day 
+    # must not overwrite each other. Same-day rerun of the SAME month still replaces. 
+    path = f"{curated}/{SOURCE}/{day}_{month:%Y-%m}.parquet"
     df.write_parquet(path, mkdir=True)
     log.info("lmu: wrote %d rows to %s", df.height, path)

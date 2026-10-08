@@ -6,7 +6,8 @@ from datetime import date, datetime, timezone
 import polars as pl 
 import requests 
 
-from app import config, storage, schema
+from app import config, storage, schema, quality
+
 
 log = logging.getLogger(__name__)
 
@@ -121,5 +122,6 @@ def run() -> None:
 
     # One file per pull date: a same-day rerun overwrites it, so a day never gets two vintages. 
     path = f"{curated}/fred/{pulled_at:%Y-%m-%d}.parquet"
+    quality.validate(df, "fred", expected_geos={"US"}, expected_metrics={m for m, _ in SERIES.values()})
     df.write_parquet(path, mkdir=True)
     log.info("fred: wrote %d rows to %s (raw in %s)", df.height, path, raw_dir)

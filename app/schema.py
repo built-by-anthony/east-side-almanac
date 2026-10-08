@@ -13,6 +13,7 @@ from typing import Iterable, Literal, get_args
 # source_as_of is an attribute of the vintage (when the source published it), not part of the key.
 # Null when the source gives no per-pull publication date (FRED: see data dictionary).
 COLUMNS = ["geo", "geo_level", "metric", "period_start", "period_type", "value", "source", "pulled_at", "source_as_of"]
+GRAIN = ["geo", "geo_level", "metric", "period_start", "period_type", "source"]
 
 CITIES = ("Woodbury", "Lake Elmo", "Oakdale", "Maplewood", "Stillwater", "Cottage Grove", "North St. Paul")
 GEO_LEVELS = ("city", "national")
@@ -33,6 +34,7 @@ class Metric:
     unit       : Unit 
     stat       : Stat
     description: str
+    cross_source_comparable: bool = True
 
     @property
     def summable(self) -> bool: 
@@ -57,7 +59,11 @@ METRICS: dict[str, Metric] = {m.name: m for m in [
 
     # Shared by redfin and northstar_lmu (same concept; window differs by period_type)
     Metric("homes_sold", "count", "count", "Closed sales in the period."),
-    Metric("new_listings", "count", "count", "Listings that came on market in the period."),
+    Metric("new_listings", "count", "count",
+           "Listings that came on market in the period. NOT comparable across sources: LMU runs "
+           "+7% to +31% above Redfin in every city checked, while homes_sold and inventory agree "
+           "(reconcile, 2026-10-08). Cause unverified; see docs/reconciliation.md.",
+           cross_source_comparable=False),
     Metric("inventory", "count", "count", "Homes for sale at the end of the period."),
     Metric("median_sale_price", "usd", "median", "Median closed sale price."),
 

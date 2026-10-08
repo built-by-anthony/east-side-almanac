@@ -29,7 +29,7 @@ def offline_lmu(monkeypatch, tmp_path):
     return tmp_path 
 
 def read_curated(root: Path) -> tuple[list[Path], pl.DataFrame]: 
-    files = sorted((root / "curated" / "lmu").glob("*.parquet"))
+    files = sorted((root / "curated" / "northstar_lmu").glob("*.parquet"))
     return files, pl.read_parquet(files)
 
 def test_same_day_rerun_keeps_one_vintage(offline_lmu):
@@ -60,3 +60,12 @@ def test_next_day_appends_a_vintage(offline_lmu):
     latest = df.filter(pl.col("pulled_at") == pl.col("pulled_at").max().over(GRAIN))
     assert latest.height == 224
     assert latest.select(GRAIN).is_duplicated().sum() == 0
+
+def test_two_report_months_same_day_are_two_runs(offline_lmu, monkeypatch):
+    lmu_pdfs.run(now=DAY1)
+    monkeypatch.setenv("LMU_REPORT_MONTH", "2026-07")
+    lmu_pdfs.run(now=DAY1)
+
+    files, df = read_curated(offline_lmu)
+    assert [f.name for f in files] == ["2026-10-08_2026-07.parquet", "2026-10-08_2026-08.parquet"]
+    assert df.height == 448

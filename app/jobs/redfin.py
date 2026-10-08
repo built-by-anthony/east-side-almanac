@@ -8,7 +8,7 @@ from pathlib import Path
 import polars as pl 
 import requests 
 
-from app import config, storage, schema
+from app import config, storage, schema, quality
 
 log = logging.getLogger(__name__)
 
@@ -165,5 +165,6 @@ def run() -> None:
 
     # One file per pull date, same as fred: a same-day rerun overwrites it. 
     path = f"{curated}/redfin/{day}.parquet"
+    quality.validate(df, "redfin", expected_geos=set(CITIES.values()), expected_metrics=set(METRICS.values()))
     df.write_parquet(path, mkdir=True)
     log.info("redfin: wrote %d rows to %s", df.height, path)
